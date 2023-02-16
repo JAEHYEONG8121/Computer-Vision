@@ -1,8 +1,14 @@
 import numpy as np
 import matplotlib.pyplot as plt
+import matplotlib.cm as cm
 from skimage import filters, feature, img_as_int
 from skimage.measure import regionprops
+import cv2
 
+def show_img(img : np.array) -> None:
+    img = (img - (img.min()))/(img.max() - img.min())
+    plt.imshow(img, cmap=cm.gray)
+    plt.show() # 0 ~ 255
 
 def get_interest_points(image, feature_width):
     '''
@@ -47,13 +53,49 @@ def get_interest_points(image, feature_width):
     '''
 
     # TODO: Your implementation here! See block comments and the project webpage for instructions
-
+    
     # These are placeholders - replace with the coordinates of your interest points!
-    xs = np.zeros(1,dtype=int)
-    ys = np.zeros(1,dtype=int)
+    xs = []
+    ys = []
     # End of placeholders
-
-    return xs, ys
+    
+    alpha = 0.06
+    sigma = 0.1
+    threshold = 0.01
+    
+    # 1. Gaussain filter를 통한 blurred image생성
+    blurred_image = filters.gaussian(image, sigma=sigma)
+    
+    # 2. cv2.Sobel를 이용하여 x, y에 대한 gradient계산
+    I_x = cv2.Sobel(blurred_image, cv2.CV_8U, 1, 0)
+    I_y = cv2.Sobel(blurred_image, cv2.CV_8U, 0, 1)
+    
+    I_xx = I_x * I_x
+    I_xy = I_x * I_y
+    I_yy = I_y * I_y
+    
+    show_img(I_x)
+    show_img(I_y)
+    show_img(I_xx)
+    show_img(I_xy)
+    show_img(I_yy)
+    
+    for y in range(0, image.shape[0]-feature_width+1) :
+        for x in range(0, image.shape[1]-feature_width+1) :
+            Sxx = np.sum(I_xx[y:y+feature_width+1, x:x+feature_width+1])
+            Syy = np.sum(I_yy[y:y+feature_width+1, x:x+feature_width+1])
+            Sxy = np.sum(I_xy[y:y+feature_width+1, x:x+feature_width+1])
+            # Cornerness score : C = det(M) - alpha * (trace(M))^2
+            detM = (Sxx * Syy) - (Sxy ** 2)
+            traceM = (Sxx + Syy)
+            C = detM - alpha * (traceM**2)
+            
+            # thresholding
+            if C > threshold :
+                xs.append(x + (feature_width//2-1))
+                ys.append(y + (feature_width//2-1))
+    
+    return np.asarray(xs), np.asarray(ys)
 
 
 def get_features(image, x, y, feature_width):
@@ -120,12 +162,64 @@ def get_features(image, x, y, feature_width):
     '''
 
     # TODO: Your implementation here! See block comments and the project webpage for instructions
-
     
-    # These are placeholders - replace with the coordinates of your interest points!
-    pass
-    features = np.zeros((len(x), 128))
-    # End of placeholders
+    features = np.zeros((len(x), 4, 4, 8))
+
+    # 1. x, y정수로 만들기
+    xs = np.round(x).astype(int)
+    ys = np.round(y).astype(int)
+    
+    # 2. 이미지에 Gaussian filter적용
+    sigma = 0.1
+    filtered_image = filters.gaussian(image, sigma=sigma)
+    
+    # 3. 이미지 내의 harris corner point 중심으로 16*16 window 만들기
+    def make_window(y, x) :
+        rows = (x - (feature_width/2 - 1), x + feature_width/2)
+        if rows[0] < 0 :
+            rows = (0, rows[1]-rows[0])
+        if rows[1] >= image.shape[0] :
+            rows = (rows[0] - (rows[1] - image.shape[0] + 1), image.shape[0] - 1)
+            
+        cols = (y - (feature_width/2 - 1), y + feature_width/2)
+        if cols[0] < 0 :
+            cols = (0, cols[1]-cols[0])
+        if cols[1] >= image.shape[0] :
+            cols = (cols[0] - (cols[1] -image.shape[0] + 1), image.shape[0] - 1)
+        
+        return int(rows[0]), int(rows[1]) + 1, int(cols[0]), int(cols[1]) + 1
+    
+    # 4. 16*16 window안의 4*4 sub window를 구성하기
+    def make_subwindow(y, x, matrix) :
+        return matrix[int(y * feature_width/4): int((y+1) * feature_width/4),
+                      int(x * feature_width/4) : int((x+1) * feature_width/4)]
+    
+    # 5. 16개(4*4)의 sub window에 속한 픽셀들의 gradient의 magnitude, orientation을 계산하기
+    dx = cv2.Sobel(filtered_image, cv2.CV_8U, 1, 0)
+    dy = cv2.Sobel(filtered_image, cv2.CV_8U, 0, 1)
+    gradient = np.sqrt(dx**2 + dy**2)
+    angle = np.arctan2(dy, dx)
+    angle[angle < 0] += 2*np.pi
+
+    for n, (x, y) in enumerate(zip(xs, ys)) :
+        #print(n, x, y)
+        x1, x2, y1, y2 = make_window(x, y)
+        grad_window = gradient[x1:x2, y1:y2]
+        angle_window = angle[x1:x2, y1:y2]
+        for i in range(int(feature_width/4)) :
+            for j in range(int(feature_width/4)) :
+                sub_grad = make_subwindow(i, j, grad_window)
+                sub_angle = make_subwindow(i, j, angle_window)
+                features[n, i, j] = np.histogram(sub_angle, bins=8, 
+                                    range=(0, 2*np.pi), weights=sub_grad)[0]
+    
+    features = features.reshape((len(xs), -1,))
+    normalize = np.linalg.norm(features, axis=1).reshape(-1, 1)
+    
+    normalize[normalize == 0] = 1
+    thresh = 0.25
+    features[ features >= thresh] = thresh
+    features = features * 0.8
     
     return features
 
@@ -162,10 +256,19 @@ def match_features(im1_features, im2_features):
     # TODO: Your implementation here! See block comments and the project webpage for instructions
 
     # These are placeholders - replace with your matches and confidences!
-    pass
+    matches = []
+    confidences = []
+    
+    for i in range(im1_features.shape[0]):
+        distances = np.sqrt(((im1_features[i,:]-im2_features)**2).sum(axis = 1))
 
-    matches     = np.zeros((1,2))
-    confidences = np.zeros(1) #평가 함수를 사용하기 위해서 confidence값이 필요합니다.
-    # End of placeholders
+        ind_sorted = np.argsort(distances)
+        
+        if (distances[ind_sorted[0]] < 0.9 * distances[ind_sorted[1]]):
+            matches.append([i, ind_sorted[0]])
+            confidences.append(1.0  - distances[ind_sorted[0]]/distances[ind_sorted[1]])
+    
+    confidences = np.asarray(confidences)
+    confidences[np.isnan(confidences)] = np.min(confidences[~np.isnan(confidences)])     
 
-    return matches, confidences
+    return np.asarray(matches), confidences
